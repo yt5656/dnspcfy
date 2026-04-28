@@ -20,7 +20,6 @@ from huaweicloudsdkdns.v2.model import (
 
 MAX_IP_PER_LINE = int(os.environ.get("MAX_IP_PER_LINE", "50"))
 MIN_IPV4_COUNT = int(os.environ.get("MIN_IPV4_COUNT", "3"))
-MIN_IPV6_COUNT = int(os.environ.get("MIN_IPV6_COUNT", "2"))
 SOURCE_URL = "https://api.uouin.com/cloudflare.html"
 
 
@@ -42,10 +41,8 @@ def filter_valid_ips(ips, version):
             print(f"⚠️ 过滤非法 IP: {ip}")
     return list(dict.fromkeys(result))[:MAX_IP_PER_LINE]
 
+
 def send_telegram(message):
-    """
-    发送 Telegram 通知
-    """
     bot_token = os.environ.get("TG_BOT_TOKEN")
     user_id = os.environ.get("TG_USER_ID")
     
@@ -108,13 +105,10 @@ class HuaWeiApi:
             print(f"{record_type} | {line} 无有效 IP，跳过更新")
             return
 
-        # 校验 IP 类型，防止页面异常时把脏数据写入 DNS
+        # 仅处理 A 记录
         if record_type == "A":
             ips = filter_valid_ips(ips, 4)
             min_count = MIN_IPV4_COUNT
-        elif record_type == "AAAA":
-            ips = filter_valid_ips(ips, 6)
-            min_count = MIN_IPV6_COUNT
         else:
             min_count = 1
 
@@ -167,10 +161,9 @@ class HuaWeiApi:
 
 
 def parse_cloudflare_html(html):
-    """从 api.uouin.com/cloudflare.html 页面中解析 Cloudflare 优选 IP。"""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", {"class": "table-striped"}) or soup.find("table")
-    best = {"默认": [], "电信": [], "联通": [], "移动": [], "IPv6": []}
+    best = {"默认": [], "电信": [], "联通": [], "移动": []}
     full = {}
 
     if not table:
@@ -192,22 +185,21 @@ def parse_cloudflare_html(html):
             print(f"⚠️ 页面数据不是合法 IP，跳过: {ip}")
             continue
 
-        if line not in full:
-            full[line] = []
-        full[line].append({"IP": ip, "带宽": cols[6], "时间": cols[8]})
-
         ip_obj = ipaddress.ip_address(ip)
-        if ip_obj.version == 6:
-            best["IPv6"].append(ip)
-        else:
+        
+        # 仅处理 IPv4
+        if ip_obj.version == 4:
+            if line not in full:
+                full[line] = []
+            full[line].append({"IP": ip, "带宽": cols[6], "时间": cols[8]})
+            
             if line not in ("电信", "联通", "移动"):
                 best["默认"].append(ip)
             else:
                 best[line].append(ip)
 
     for k in best:
-        version = 6 if k == "IPv6" else 4
-        best[k] = filter_valid_ips(best[k], version)
+        best[k] = filter_valid_ips(best[k], 4)
 
     if not any(best.values()):
         raise Exception("未解析到任何 0 丢包的合法 Cloudflare IP")
@@ -216,10 +208,6 @@ def parse_cloudflare_html(html):
 
 
 def fetch_cloudflare_ips():
-    """
-    优先普通 requests 抓取网页，失败或解析不到表格时再使用 requests-html 渲染 fallback。
-    不使用 api.uouin.com 的开放 API。
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -244,11 +232,7 @@ def fetch_cloudflare_ips():
 
 
 def protect_best_ips(best_ips):
-    """
-    异常保护：有效 IP 数量不足的线路不更新。
-    全部线路都不足时直接失败，避免污染 DNS。
-    """
-    protected = {"默认": [], "电信": [], "联通": [], "移动": [], "IPv6": []}
+    protected = {"默认": [], "电信": [], "联通": [], "移动": []}
 
     for line in ["默认", "电信", "联通", "移动"]:
         ips = filter_valid_ips(best_ips.get(line, []), 4)
@@ -256,12 +240,6 @@ def protect_best_ips(best_ips):
             print(f"⚠️ {line} A记录有效 IP 数量 {len(ips)} < {MIN_IPV4_COUNT}，本线路不更新")
             continue
         protected[line] = ips
-
-    ipv6 = filter_valid_ips(best_ips.get("IPv6", []), 6)
-    if len(ipv6) < MIN_IPV6_COUNT:
-        print(f"⚠️ IPv6 AAAA记录有效 IP 数量 {len(ipv6)} < {MIN_IPV6_COUNT}，本线路不更新")
-    else:
-        protected["IPv6"] = ipv6
 
     if not any(protected.values()):
         raise Exception("所有线路有效 IP 数量均不足，取消 DNS 更新")
@@ -284,57 +262,42 @@ if __name__ == "__main__":
     try:
         print(f"开始更新 DNS: {full_domain}")
         
-        # 初始化华为云 API
         hw = HuaWeiApi(ak, sk, region)
         
-        # 获取 Cloudflare IP
         full_data, best_ips = fetch_cloudflare_ips()
         best_ips = protect_best_ips(best_ips)
         
-        # 统计更新信息
         update_summary = []
 
-        # 更新 IPv4
+        # 仅更新 IPv4
         for line in ["默认", "电信", "联通", "移动"]:
             ip_list = best_ips.get(line, [])
             if ip_list:
                 hw.set_records(full_domain, ip_list, record_type="A", line=line)
                 update_summary.append(f"✅ {line} A记录: {len(ip_list)} 个IP")
 
-        # 更新 IPv6
-        ip_list_v6 = best_ips.get("IPv6", [])
-        if ip_list_v6:
-            hw.set_records(full_domain, ip_list_v6, record_type="AAAA", line="默认")
-            update_summary.append(f"✅ IPv6 AAAA记录: {len(ip_list_v6)} 个IP")
-
-        # 保存 JSON
         with open("cloudflare_bestip.json", "w", encoding="utf-8") as f:
             json.dump({"最优IP": best_ips, "完整数据": full_data}, f, ensure_ascii=False, indent=4)
         print("JSON 文件保存到 cloudflare_bestip.json")
 
-        # 保存 TXT 文件（使用北京时间）
         china_tz = timezone(timedelta(hours=8))
         now = datetime.now(china_tz).strftime("%Y/%m/%d %H:%M:%S")
         txt_lines = []
 
-        for line in ["默认", "电信", "联通", "移动", "IPv6"]:
+        for line in ["默认", "电信", "联通", "移动"]:
             ip_list = best_ips.get(line, [])
             if not ip_list:
                 continue
             txt_lines.append(now)
             for ip in ip_list:
-                if ":" in ip:  # IPv6
-                    txt_lines.append(f"[{ip}]#{line}")
-                else:
-                    txt_lines.append(f"{ip}#{line}")
-            txt_lines.append("")  # 每组之间空行
+                txt_lines.append(f"{ip}#{line}")
+            txt_lines.append("")
 
         with open("cloudflare_bestip.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(txt_lines))
 
         print("TXT 文件保存到 cloudflare_bestip.txt")
         
-        # 发送成功通知（可选）
         success_msg = f"""✅ <b>DNS 更新成功</b>
 
 📋 域名: <code>{full_domain}</code>
@@ -349,7 +312,6 @@ if __name__ == "__main__":
         error_msg = str(e)
         print(f"❌ 错误: {error_msg}")
         
-        # 发送失败通知
         china_tz = timezone(timedelta(hours=8))
         now = datetime.now(china_tz).strftime("%Y/%m/%d %H:%M:%S")
         
