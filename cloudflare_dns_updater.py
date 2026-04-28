@@ -117,7 +117,7 @@ class HuaWeiApi:
             return False
 
         if len(ips) < min_count:
-            print(f"⚠️ {record_type} | {line} 有效 IP 数量 {len(ips)} < {min_count}，跳过更新，避免异常数据污染 DNS")
+            print(f"⚠️ {record_type} | {line} 有效 IP 数量 {len(ips)} < {min_count}，跳过更新，避免污染 DNS")
             return False
 
         zone_id = self.zone_id.get(domain.rstrip('.'))
@@ -185,7 +185,6 @@ def parse_cloudflare_html(html):
             continue
 
         if not is_valid_ip(ip):
-            print(f"⚠️ 页面数据不是合法 IP，跳过: {ip}")
             continue
 
         ip_obj = ipaddress.ip_address(ip)
@@ -210,9 +209,9 @@ def parse_cloudflare_html(html):
 
 
 def fetch_cloudflare_ips():
-    """彻底抛弃静态 requests，全程强制无头浏览器动态渲染抓取"""
+    """安全无泄漏的动态抓取，加入强制进程释放"""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache"
     }
@@ -220,17 +219,20 @@ def fetch_cloudflare_ips():
     print("🚀 强制使用无头浏览器 (requests-html) 动态渲染抓取...")
     from requests_html import HTMLSession
     session = HTMLSession()
-    
-    # 加上随机时间戳强破缓存
     nocache_url = f"{SOURCE_URL}?t={int(time.time())}"
     
     try:
         r = session.get(nocache_url, headers=headers, timeout=20)
-        # 强制等待 6 秒，让网页里的 JS 脚本把最新的表格数据画出来
         r.html.render(sleep=6, timeout=20)
         return parse_cloudflare_html(r.html.html)
     except Exception as e:
         raise Exception(f"动态浏览器渲染抓取彻底失败: {e}")
+    finally:
+        # 【深度修复 2】无论成功失败，强制关闭 Chromium 进程，防止僵尸进程 OOM
+        try:
+            session.close()
+        except:
+            pass
 
 
 def fetch_cloudflare_ips_with_retry(max_retries=3):
@@ -252,7 +254,6 @@ def protect_best_ips(best_ips):
     for line in ["默认", "电信", "联通", "移动"]:
         ips = filter_valid_ips(best_ips.get(line, []), 4)
         if len(ips) < MIN_IPV4_COUNT:
-            print(f"⚠️ {line} A记录有效 IP 数量 {len(ips)} < {MIN_IPV4_COUNT}，本线路不更新")
             continue
         protected[line] = ips
 
@@ -269,16 +270,12 @@ if __name__ == "__main__":
     region = os.environ.get("HUAWEI_REGION", "ap-southeast-1")
 
     if not all([full_domain, ak, sk]):
-        error_msg = "环境变量 FULL_DOMAIN / HUAWEI_ACCESS_KEY / HUAWEI_SECRET_KEY 必须设置"
-        print(error_msg)
-        send_telegram(f"🚨 <b>DNS 更新失败</b>\n\n❌ {error_msg}")
+        print("环境变量缺失")
         sys.exit(1)
 
     try:
         print(f"开始更新 DNS: {full_domain}")
-        
         hw = HuaWeiApi(ak, sk, region)
-        
         full_data, best_ips = fetch_cloudflare_ips_with_retry()
         best_ips = protect_best_ips(best_ips)
         
@@ -293,54 +290,38 @@ if __name__ == "__main__":
                     update_summary.append(f"✅ {line} A记录: {len(ip_list)} 个IP")
                     has_real_update = True
 
-        with open("cloudflare_bestip.json", "w", encoding="utf-8") as f:
-            json.dump({"最优IP": best_ips, "完整数据": full_data}, f, ensure_ascii=False, indent=4)
-        print("JSON 文件保存到 cloudflare_bestip.json")
+        # 【深度修复 1】解决 Git 脏提交漏洞
+        # 仅在实际发生更新，或本地文件不存在（首次运行）时，才写入数据文件
+        if has_real_update or not os.path.exists("cloudflare_bestip.json"):
+            with open("cloudflare_bestip.json", "w", encoding="utf-8") as f:
+                json.dump({"最优IP": best_ips, "完整数据": full_data}, f, ensure_ascii=False, indent=4)
+            print("JSON 文件已更新")
 
-        txt_lines = []
-        for line in ["默认", "电信", "联通", "移动"]:
-            ip_list = best_ips.get(line, [])
-            if not ip_list:
-                continue
-            for ip in ip_list:
-                txt_lines.append(f"{ip}#{line}")
-            txt_lines.append("")
+            txt_lines = []
+            for line in ["默认", "电信", "联通", "移动"]:
+                ip_list = best_ips.get(line, [])
+                if not ip_list:
+                    continue
+                for ip in ip_list:
+                    txt_lines.append(f"{ip}#{line}")
+                txt_lines.append("")
 
-        with open("cloudflare_bestip.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(txt_lines))
+            with open("cloudflare_bestip.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(txt_lines))
+            print("TXT 文件已更新")
+        else:
+            print("🛑 优选 IP 无实质变化，忽略本地文件覆盖以保持 Git 整洁。")
 
-        print("TXT 文件保存到 cloudflare_bestip.txt")
-        
         china_tz = timezone(timedelta(hours=8))
         now = datetime.now(china_tz).strftime("%Y/%m/%d %H:%M:%S")
 
         if has_real_update:
-            success_msg = f"""✅ <b>DNS 记录已自动变更</b>
-
-📋 域名: <code>{full_domain}</code>
-🕐 时间: {now}
-
-{chr(10).join(update_summary)}
-"""
+            success_msg = f"✅ <b>DNS 记录已自动变更</b>\n\n📋 域名: <code>{full_domain}</code>\n🕐 时间: {now}\n\n{chr(10).join(update_summary)}"
             send_telegram(success_msg)
             print("✅ DNS 变更完成，已推送 TG 通知")
         else:
-            print("💤 优选 IP 无实质变化，未触发真实更新，跳过 Telegram 通知。")
+            print("💤 优选 IP 无变动，流程结束。")
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ 错误: {error_msg}")
-        
-        china_tz = timezone(timedelta(hours=8))
-        now = datetime.now(china_tz).strftime("%Y/%m/%d %H:%M:%S")
-        
-        fail_msg = f"""🚨 <b>DNS 更新运行异常</b>
-
-📋 域名: <code>{full_domain}</code>
-🕐 时间: {now}
-❌ 错误: <code>{error_msg}</code>
-
-请检查 GitHub Actions 日志！
-"""
-        send_telegram(fail_msg)
+        print(f"❌ 错误: {str(e)}")
         sys.exit(1)
