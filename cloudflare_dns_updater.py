@@ -3,7 +3,7 @@
 import os
 import json
 import sys
-import time  # 新增：用于网络重试的等待时间
+import time
 import ipaddress
 import requests
 from datetime import datetime, timezone, timedelta
@@ -106,7 +106,6 @@ class HuaWeiApi:
             print(f"{record_type} | {line} 无有效 IP，跳过更新")
             return False
 
-        # 仅处理 A 记录
         if record_type == "A":
             ips = filter_valid_ips(ips, 4)
             min_count = MIN_IPV4_COUNT
@@ -142,10 +141,10 @@ class HuaWeiApi:
                     )
                     self.client.update_record_set(req)
                     print(f"更新 {line} {record_type} => {ips}")
-                    return True  # 记录发生了真实变更
+                    return True
                 else:
                     print(f"{line} {record_type} 无变化，跳过")
-                    return False # 记录无变更
+                    return False
         else:
             req = CreateRecordSetRequest()
             req.zone_id = zone_id
@@ -161,7 +160,7 @@ class HuaWeiApi:
             }
             self.client.create_record_set(req)
             print(f"创建 {line} {record_type} => {ips}")
-            return True  # 创建了新记录
+            return True
 
 
 def parse_cloudflare_html(html):
@@ -191,7 +190,6 @@ def parse_cloudflare_html(html):
 
         ip_obj = ipaddress.ip_address(ip)
         
-        # 仅处理 IPv4
         if ip_obj.version == 4:
             if line not in full:
                 full[line] = []
@@ -212,41 +210,30 @@ def parse_cloudflare_html(html):
 
 
 def fetch_cloudflare_ips():
-    # 核心技巧 1：在网址后面加一个随机时间戳参数 (例如 ?t=1714270000)
-    # 这样每次请求的 URL 都是全新的，强迫 CDN 回源站拉取最新数据，避开缓存
-    nocache_url = f"{SOURCE_URL}?t={int(time.time())}"
-    
+    """彻底抛弃静态 requests，全程强制无头浏览器动态渲染抓取"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        # 核心技巧 2：在请求头里明确告诉服务器：不要给我发缓存！
         "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        "Pragma": "no-cache"
     }
-
+    
+    print("🚀 强制使用无头浏览器 (requests-html) 动态渲染抓取...")
+    from requests_html import HTMLSession
+    session = HTMLSession()
+    
+    # 加上随机时间戳强破缓存
+    nocache_url = f"{SOURCE_URL}?t={int(time.time())}"
+    
     try:
-        print("使用普通 requests 抓取 Cloudflare 优选页面...")
-        # 注意这里用的是加了时间戳的 nocache_url
-        r = requests.get(nocache_url, headers=headers, timeout=20)
-        r.raise_for_status()
-        return parse_cloudflare_html(r.text)
-    except Exception as e:
-        print(f"⚠️ 普通抓取失败，切换 requests-html 渲染 fallback: {e}")
-
-    try:
-        from requests_html import HTMLSession
-        session = HTMLSession()
-        # Fallback 抓取也用强力破缓存的 URL
         r = session.get(nocache_url, headers=headers, timeout=20)
+        # 强制等待 6 秒，让网页里的 JS 脚本把最新的表格数据画出来
         r.html.render(sleep=6, timeout=20)
         return parse_cloudflare_html(r.html.html)
     except Exception as e:
-        raise Exception(f"Cloudflare IP 页面抓取失败: {e}")
-
+        raise Exception(f"动态浏览器渲染抓取彻底失败: {e}")
 
 
 def fetch_cloudflare_ips_with_retry(max_retries=3):
-    """带重试机制的抓取函数，解决偶尔的网络波动"""
     for attempt in range(max_retries):
         try:
             return fetch_cloudflare_ips()
@@ -292,29 +279,24 @@ if __name__ == "__main__":
         
         hw = HuaWeiApi(ak, sk, region)
         
-        # 使用带有 3 次重试机制的抓取函数
         full_data, best_ips = fetch_cloudflare_ips_with_retry()
         best_ips = protect_best_ips(best_ips)
         
         update_summary = []
-        has_real_update = False  # 变更标记
+        has_real_update = False
 
-        # 仅更新 IPv4
         for line in ["默认", "电信", "联通", "移动"]:
             ip_list = best_ips.get(line, [])
             if ip_list:
-                # 获取是否发生了实际更新的布尔值
                 updated = hw.set_records(full_domain, ip_list, record_type="A", line=line)
                 if updated:
                     update_summary.append(f"✅ {line} A记录: {len(ip_list)} 个IP")
                     has_real_update = True
 
-        # 保存 JSON 数据文件
         with open("cloudflare_bestip.json", "w", encoding="utf-8") as f:
             json.dump({"最优IP": best_ips, "完整数据": full_data}, f, ensure_ascii=False, indent=4)
         print("JSON 文件保存到 cloudflare_bestip.json")
 
-        # 生成纯净的 TXT 文件（去掉了时间戳，避免无意义的 Git Commit）
         txt_lines = []
         for line in ["默认", "电信", "联通", "移动"]:
             ip_list = best_ips.get(line, [])
@@ -329,7 +311,6 @@ if __name__ == "__main__":
 
         print("TXT 文件保存到 cloudflare_bestip.txt")
         
-        # 智能通知：仅在发生真实 IP 变动时才发送 Telegram 消息
         china_tz = timezone(timedelta(hours=8))
         now = datetime.now(china_tz).strftime("%Y/%m/%d %H:%M:%S")
 
