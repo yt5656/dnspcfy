@@ -212,14 +212,22 @@ def parse_cloudflare_html(html):
 
 
 def fetch_cloudflare_ips():
+    # 核心技巧 1：在网址后面加一个随机时间戳参数 (例如 ?t=1714270000)
+    # 这样每次请求的 URL 都是全新的，强迫 CDN 回源站拉取最新数据，避开缓存
+    nocache_url = f"{SOURCE_URL}?t={int(time.time())}"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        # 核心技巧 2：在请求头里明确告诉服务器：不要给我发缓存！
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
     }
 
     try:
         print("使用普通 requests 抓取 Cloudflare 优选页面...")
-        r = requests.get(SOURCE_URL, headers=headers, timeout=20)
+        # 注意这里用的是加了时间戳的 nocache_url
+        r = requests.get(nocache_url, headers=headers, timeout=20)
         r.raise_for_status()
         return parse_cloudflare_html(r.text)
     except Exception as e:
@@ -228,11 +236,13 @@ def fetch_cloudflare_ips():
     try:
         from requests_html import HTMLSession
         session = HTMLSession()
-        r = session.get(SOURCE_URL, headers=headers, timeout=20)
+        # Fallback 抓取也用强力破缓存的 URL
+        r = session.get(nocache_url, headers=headers, timeout=20)
         r.html.render(sleep=6, timeout=20)
         return parse_cloudflare_html(r.html.html)
     except Exception as e:
         raise Exception(f"Cloudflare IP 页面抓取失败: {e}")
+
 
 
 def fetch_cloudflare_ips_with_retry(max_retries=3):
