@@ -59,68 +59,11 @@ jobs:
             cloudflare_bestip.txt
           retention-days: 7
 
-      - name: 📝 更新 README.md 报告
-        run: |
-          # 获取当前时间
-          CURRENT_TIME=$(TZ='Asia/Shanghai' date '+%Y/%m/%d %H:%M:%S')
-          
-          # 生成 IP 统计
-          if [ -f cloudflare_bestip.json ]; then
-            IP_STATS=$(python3 << 'PYTHON'
-          import json
-          try:
-              with open('cloudflare_bestip.json', 'r', encoding='utf-8') as f:
-                  data = json.load(f)
-                  best = data.get('最优IP', {})
-                  
-                  lines = []
-                  for line in ['默认', '电信', '联通', '移动']:
-                      ips = best.get(line, [])
-                      if ips:
-                          lines.append(f'- ✅ **{line} A记录:** {len(ips)} 个IP')
-                  
-                  ipv6 = best.get('IPv6', [])
-                  if ipv6:
-                      lines.append(f'- ✅ **IPv6 AAAA记录:** {len(ipv6)} 个IP')
-                  
-                  print('\n'.join(lines))
-          except Exception as e:
-              print(f'❌ 解析失败: {e}')
-          PYTHON
-          )
-          else
-            IP_STATS="❌ 未生成数据文件"
-          fi
-          
-          # 生成完整报告
-          cat > report.tmp << EOF
-          ### ✅ DNS 更新成功
-          
-          🕐 **更新时间:** ${CURRENT_TIME}
-          
-          ${IP_STATS}
-          EOF
-          
-          # 替换 README.md 中的报告部分
-          awk '
-          BEGIN { p=1 }
-          /<!-- REPORT_START -->/ { 
-              print
-              system("cat report.tmp")
-              p=0
-          }
-          /<!-- REPORT_END -->/ { p=1 }
-          p
-          ' README.md > README.md.tmp
-          
-          mv README.md.tmp README.md
-          rm -f report.tmp
-
       - name: 📝 提交更新到仓库
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add README.md cloudflare_bestip.json cloudflare_bestip.txt
+          git add cloudflare_bestip.json cloudflare_bestip.txt
           git commit -m "🔄 更新 Cloudflare IP [skip ci]" || echo "No changes to commit"
           git pull --rebase origin HEAD || true
           git push origin HEAD || echo "Push 失败，可能没有变化"
@@ -154,10 +97,6 @@ jobs:
                       ips = best.get(line, [])
                       if ips:
                           print(f'✅ **{line} A记录:** {len(ips)} 个IP')
-                  
-                  ipv6 = best.get('IPv6', [])
-                  if ipv6:
-                      print(f'✅ **IPv6 AAAA记录:** {len(ipv6)} 个IP')
           except Exception as e:
               print(f'❌ 解析失败: {e}')
           PYTHON
