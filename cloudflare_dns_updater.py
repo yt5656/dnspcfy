@@ -6,6 +6,7 @@ import sys
 import re
 import ipaddress
 import requests
+from time import monotonic
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -347,30 +348,58 @@ def validate_cloudflare_data(best_ips, data_times):
 
 def fetch_rendered_html(url):
     """
-    使用 Playwright 渲染页面并返回最终 HTML。
+    使用 Playwright 渲染页面并返回通过新鲜度校验的最终 HTML。
+
+    页面首屏 HTML 内包含 2024 年旧表格，不能只等待表格或 IP 出现。
+    必须持续轮询渲染后的 DOM，直到表格数据通过 validate_cloudflare_data 校验。
     """
-    timeout_ms = get_int_env("PLAYWRIGHT_TIMEOUT_MS", 60000)
+    timeout_ms = get_int_env("PLAYWRIGHT_TIMEOUT_MS", 90000)
+    poll_interval_ms = get_int_env("PLAYWRIGHT_POLL_INTERVAL_MS", 2000)
+    user_agent = os.environ.get(
+        "PLAYWRIGHT_USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
-            page = browser.new_page()
+            context = browser.new_context(
+                user_agent=user_agent,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1366, "height": 768},
+            )
+            page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_selector("table.table-striped", state="visible", timeout=timeout_ms)
-            page.wait_for_function(
-                """
-                () => {
-                    const rows = Array.from(document.querySelectorAll('table.table-striped tr'));
-                    return rows.some(row => {
-                        const cells = Array.from(row.querySelectorAll('td, th')).map(cell => cell.innerText.trim());
-                        const ip = cells[2] || '';
-                        return /^(\\d{1,3}\\.){3}\\d{1,3}$/.test(ip) || (ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip));
-                    });
-                }
-                """,
-                timeout=timeout_ms,
-            )
-            return page.content()
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
+            except PlaywrightTimeoutError:
+                # 动态页面可能持续有请求，networkidle 超时不代表失败，后续以数据校验为准。
+                pass
+
+            deadline = monotonic() + timeout_ms / 1000
+            last_error = "尚未读取到有效数据"
+            attempt = 0
+
+            while monotonic() < deadline:
+                attempt += 1
+                html = page.content()
+
+                try:
+                    _, best_ips, data_times = parse_cloudflare_table(html)
+                    validate_cloudflare_data(best_ips, data_times)
+                    print(f"✅ Playwright 动态数据已通过校验，轮询次数: {attempt}")
+                    return html
+                except Exception as e:
+                    last_error = str(e)
+                    print(f"⏳ 等待页面动态数据刷新，第 {attempt} 次: {last_error}")
+                    page.wait_for_timeout(poll_interval_ms)
+
+            raise Exception(f"Playwright 已打开页面，但动态最新数据未刷新: {last_error}")
         except PlaywrightTimeoutError as e:
             raise Exception(f"Playwright 页面渲染超时: {e}") from e
         finally:
