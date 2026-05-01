@@ -4,10 +4,6 @@ on:
     - cron: '0 */1 * * *' # ⏰ 每小时自动运行
   workflow_dispatch: # 🖱️ 支持手动触发
 
-concurrency:
-  group: cf-dns-update
-  cancel-in-progress: true
-
 permissions:
   contents: write
   actions: write  # 允许删除工作流运行记录
@@ -16,36 +12,33 @@ jobs:
   update_dns:
     name: 🔄 更新 DNS 记录
     runs-on: ubuntu-latest
-    
+
     env:
       FULL_DOMAIN: ${{ secrets.FULL_DOMAIN }}
       HUAWEI_ACCESS_KEY: ${{ secrets.HUAWEI_ACCESS_KEY }}
       HUAWEI_SECRET_KEY: ${{ secrets.HUAWEI_SECRET_KEY }}
       HUAWEI_REGION: ${{ secrets.HUAWEI_REGION }}
+      ENABLE_IPV6_DNS_SYNC: ${{ secrets.ENABLE_IPV6_DNS_SYNC }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_USER_ID: ${{ secrets.TG_USER_ID }}
-    
+
     steps:
       - name: 📥 检出代码
         uses: actions/checkout@v4
 
       - name: 🐍 设置 Python 环境
-        uses: actions/setup-python@v5 # 🚀 已升级至 v5，支持 Node.js 24
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.11
-
-      - name: 💾 缓存 pip 依赖
-        uses: actions/cache@v4 # 🚀 已升级至 v4，支持 Node.js 24
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/cloudflare_dns_updater.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: 📦 安装 Python 依赖
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 huaweicloudsdkcore huaweicloudsdkdns requests-html lxml[html_clean]
+          python -m pip install -r requirements.txt
+          python -m pip show playwright
+          python -m playwright install --with-deps chromium
 
       - name: 🚀 运行脚本
         run: python cloudflare_dns_updater.py
@@ -73,18 +66,20 @@ jobs:
         run: |
           echo "## 🌐 Cloudflare IP 优选更新报告" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ job.status }}" == "success" ]; then
             echo "### ✅ DNS 更新成功" >> $GITHUB_STEP_SUMMARY
           else
             echo "### ❌ DNS 更新失败" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📋 基本信息" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "🕐 **时间:** $(TZ='Asia/Shanghai' date '+%Y/%m/%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
-          
+          echo "🔌 **IPv6 DNS 同步:** ${ENABLE_IPV6_DNS_SYNC:-false}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           if [ -f cloudflare_bestip.json ]; then
             python3 << 'PYTHON' >> $GITHUB_STEP_SUMMARY
           import json
@@ -92,27 +87,31 @@ jobs:
               with open('cloudflare_bestip.json', 'r', encoding='utf-8') as f:
                   data = json.load(f)
                   best = data.get('最优IP', {})
-                  
+
                   for line in ['默认', '电信', '联通', '移动']:
                       ips = best.get(line, [])
                       if ips:
                           print(f'✅ **{line} A记录:** {len(ips)} 个IP')
+
+                  ipv6 = best.get('IPv6', [])
+                  if ipv6:
+                      print(f'ℹ️ **IPv6 数据:** {len(ipv6)} 个IP，是否同步 DNS 取决于 ENABLE_IPV6_DNS_SYNC')
           except Exception as e:
               print(f'❌ 解析失败: {e}')
           PYTHON
           fi
-          
+
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          
+
           ### 📦 生成的文件
-          
+
           | 文件名 | 说明 | 用途 |
           |--------|------|------|
           | 📄 `cloudflare_bestip.json` | JSON 格式数据 | 程序调用 |
           | 📄 `cloudflare_bestip.txt` | 纯文本格式 | 客户端导入 |
-          
+
           ### 🔗 快速链接
-          
+
           - 📥 [下载 Artifacts](../../actions/runs/${{ github.run_id }})
           - 📂 [查看仓库文件](../../tree/${{ github.ref_name }})
           EOF
@@ -124,42 +123,42 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🔍 开始清理旧运行记录..."
-          
+
           WORKFLOW_ID=$(gh api repos/${{ github.repository }}/actions/workflows \
             --jq '.workflows[] | select(.name=="${{ github.workflow }}") | .id')
-          
+
           if [ -z "$WORKFLOW_ID" ]; then
             echo "❌ 未找到工作流 ID"
             exit 0
           fi
-          
+
           TOTAL_RUNS=$(gh api "repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=1" \
             --jq '.total_count')
-          
+
           echo "📊 总运行次数: $TOTAL_RUNS"
-          
+
           if [ "$TOTAL_RUNS" -le 4 ]; then
             echo "✅ 运行记录不超过 4 条，无需清理"
             exit 0
           fi
-          
+
           RUN_IDS=$(gh api "repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
             --jq '.workflow_runs[4:] | .[].id')
-          
+
           if [ -z "$RUN_IDS" ]; then
             echo "✅ 没有需要清理的记录"
             exit 0
           fi
-          
+
           DELETE_COUNT=$(echo "$RUN_IDS" | wc -l)
           echo "🗑️  准备删除 $DELETE_COUNT 条旧记录"
-          
+
           SUCCESS_COUNT=0
           FAIL_COUNT=0
-          
+
           for run_id in $RUN_IDS; do
             echo -n "🗑️  删除运行 #$run_id ... "
-            
+
             if gh api -X DELETE "repos/${{ github.repository }}/actions/runs/${run_id}" 2>/dev/null; then
               echo "✅"
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
@@ -167,10 +166,10 @@ jobs:
               echo "❌"
               FAIL_COUNT=$((FAIL_COUNT + 1))
             fi
-            
+
             sleep 0.5
           done
-          
+
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "✅ 清理完成！"
@@ -180,5 +179,3 @@ jobs:
           fi
           echo "📦 保留最新: 4 条"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
-          exit 0
