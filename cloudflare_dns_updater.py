@@ -3,11 +3,12 @@
 import os
 import json
 import sys
-import time
+import re
 import ipaddress
 import requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from huaweicloudsdkcore.auth.credentials import BasicCredentials
 from huaweicloudsdkdns.v2 import DnsClient
 from huaweicloudsdkdns.v2.region.dns_region import DnsRegion
@@ -19,31 +20,39 @@ from huaweicloudsdkdns.v2.model import (
     CreateRecordSetRequest
 )
 
-MAX_IP_PER_LINE = int(os.environ.get("MAX_IP_PER_LINE", "50"))
-MIN_IPV4_COUNT = int(os.environ.get("MIN_IPV4_COUNT", "3"))
-SOURCE_URL = "https://api.uouin.com/cloudflare.html"
+MAX_IP_PER_LINE = 50
+CLOUDFLARE_URL = "https://api.uouin.com/cloudflare.html"
+CHINA_TZ = timezone(timedelta(hours=8))
 
 
-def is_valid_ip(ip, version=None):
+def get_bool_env(name, default=False):
+    """
+    读取布尔环境变量。
+    """
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_int_env(name, default):
+    """
+    读取整数环境变量。
+    """
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
     try:
-        ip_obj = ipaddress.ip_address(str(ip).strip())
+        return int(value)
     except ValueError:
-        return False
-    return version is None or ip_obj.version == version
-
-
-def filter_valid_ips(ips, version):
-    result = []
-    for ip in ips or []:
-        ip = str(ip).strip()
-        if is_valid_ip(ip, version):
-            result.append(ip)
-        else:
-            print(f"⚠️ 过滤非法 IP: {ip}")
-    return list(dict.fromkeys(result))[:MAX_IP_PER_LINE]
+        print(f"⚠️ 环境变量 {name}={value} 不是整数，使用默认值 {default}")
+        return default
 
 
 def send_telegram(message):
+    """
+    发送 Telegram 通知
+    """
     bot_token = os.environ.get("TG_BOT_TOKEN")
     user_id = os.environ.get("TG_USER_ID")
     
@@ -104,21 +113,20 @@ class HuaWeiApi:
     def set_records(self, domain, ips, record_type="A", line="默认", ttl=300):
         if not ips:
             print(f"{record_type} | {line} 无有效 IP，跳过更新")
-            return False
+            return
 
+        # 过滤 IP 类型
         if record_type == "A":
-            ips = filter_valid_ips(ips, 4)
-            min_count = MIN_IPV4_COUNT
-        else:
-            min_count = 1
+            ips = [ip for ip in ips if "." in ip]
+        elif record_type == "AAAA":
+            ips = [ip for ip in ips if ":" in ip]
 
         if not ips:
             print(f"{record_type} | {line} 无匹配 IP，跳过")
-            return False
+            return
 
-        if len(ips) < min_count:
-            print(f"⚠️ {record_type} | {line} 有效 IP 数量 {len(ips)} < {min_count}，跳过更新，避免污染 DNS")
-            return False
+        # 去重
+        ips = list(dict.fromkeys(ips))[:MAX_IP_PER_LINE]
 
         zone_id = self.zone_id.get(domain.rstrip('.'))
         if zone_id is None:
@@ -141,10 +149,8 @@ class HuaWeiApi:
                     )
                     self.client.update_record_set(req)
                     print(f"更新 {line} {record_type} => {ips}")
-                    return True
                 else:
                     print(f"{line} {record_type} 无变化，跳过")
-                    return False
         else:
             req = CreateRecordSetRequest()
             req.zone_id = zone_id
@@ -160,107 +166,225 @@ class HuaWeiApi:
             }
             self.client.create_record_set(req)
             print(f"创建 {line} {record_type} => {ips}")
-            return True
 
 
-def parse_cloudflare_html(html):
+
+def is_valid_ip(ip):
+    """
+    校验 IP 地址格式。
+    """
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+def is_zero_packet_loss(packet_loss):
+    """
+    判断丢包率是否为 0。
+    """
+    value = packet_loss.strip().replace("％", "%")
+    if not value.endswith("%"):
+        return False
+    try:
+        return float(value[:-1]) == 0
+    except ValueError:
+        return False
+
+
+def parse_data_time(value):
+    """
+    解析页面表格中的时间字段。
+    """
+    text = value.strip()
+    now = datetime.now(CHINA_TZ)
+
+    if not text:
+        return None
+
+    if "刚刚" in text:
+        return now
+
+    minute_match = re.search(r"(\d+)\s*分钟", text)
+    if minute_match:
+        return now - timedelta(minutes=int(minute_match.group(1)))
+
+    hour_match = re.search(r"(\d+)\s*小时", text)
+    if hour_match:
+        return now - timedelta(hours=int(hour_match.group(1)))
+
+    if text.startswith("今天"):
+        time_text = text.replace("今天", "").strip()
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                parsed = datetime.strptime(time_text, fmt)
+                return now.replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, microsecond=0)
+            except ValueError:
+                continue
+
+    formats_with_year = (
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y.%m.%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y.%m.%d %H:%M",
+    )
+    for fmt in formats_with_year:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=CHINA_TZ)
+        except ValueError:
+            continue
+
+    formats_without_year = (
+        "%m/%d %H:%M:%S",
+        "%m-%d %H:%M:%S",
+        "%m.%d %H:%M:%S",
+        "%m/%d %H:%M",
+        "%m-%d %H:%M",
+        "%m.%d %H:%M",
+    )
+    for fmt in formats_without_year:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return now.replace(
+                month=parsed.month,
+                day=parsed.day,
+                hour=parsed.hour,
+                minute=parsed.minute,
+                second=parsed.second,
+                microsecond=0
+            )
+        except ValueError:
+            continue
+
+    return None
+
+
+def parse_cloudflare_table(html):
+    """
+    解析渲染后的 Cloudflare 优选 IP 表格。
+    """
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", {"class": "table-striped"}) or soup.find("table")
-    best = {"默认": [], "电信": [], "联通": [], "移动": []}
+    table = soup.find("table", {"class": "table-striped"})
+    best = {"默认": [], "电信": [], "联通": [], "移动": [], "IPv6": []}
     full = {}
+    data_times = []
 
     if not table:
         raise Exception("无法获取 Cloudflare IP 表格数据")
 
     for tr in table.find_all("tr")[1:]:
-        cols = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+        cols = [c.text.strip() for c in tr.find_all(["td", "th"])]
         if len(cols) < 9:
             continue
 
         line = cols[1]
-        ip = cols[2].strip()
-        packet = cols[3].strip()
-
-        if packet != "0.00%":
-            continue
+        ip = cols[2]
+        packet = cols[3]
+        data_time_text = cols[8]
 
         if not is_valid_ip(ip):
             continue
 
-        ip_obj = ipaddress.ip_address(ip)
-        
-        if ip_obj.version == 4:
-            if line not in full:
-                full[line] = []
-            full[line].append({"IP": ip, "带宽": cols[6], "时间": cols[8]})
-            
+        if not is_zero_packet_loss(packet):
+            continue
+
+        parsed_time = parse_data_time(data_time_text)
+        if parsed_time:
+            data_times.append(parsed_time)
+
+        if line not in full:
+            full[line] = []
+        full[line].append({"IP": ip, "带宽": cols[6], "时间": data_time_text})
+
+        # 分类 IP
+        if ":" in ip:
+            best["IPv6"].append(ip)
+        else:
+            # 多线 / 全网 / 默认 都算默认
             if line not in ("电信", "联通", "移动"):
                 best["默认"].append(ip)
             else:
                 best[line].append(ip)
 
+    # 去重 + 限制数量
     for k in best:
-        best[k] = filter_valid_ips(best[k], 4)
+        best[k] = list(dict.fromkeys(best[k]))[:MAX_IP_PER_LINE]
 
-    if not any(best.values()):
-        raise Exception("未解析到任何 0 丢包的合法 Cloudflare IP")
+    return full, best, data_times
 
-    return full, best
+
+def validate_cloudflare_data(best_ips, data_times):
+    """
+    校验抓取结果，避免使用空数据或过期数据更新 DNS。
+    """
+    min_ipv4_count = get_int_env("MIN_IPV4_IP_COUNT", 1)
+    max_data_age_hours = get_int_env("MAX_DATA_AGE_HOURS", 24)
+
+    ipv4_count = sum(len(best_ips.get(line, [])) for line in ["默认", "电信", "联通", "移动"])
+    if ipv4_count < min_ipv4_count:
+        raise Exception(f"IPv4 优选 IP 数量不足，当前 {ipv4_count} 个，最少需要 {min_ipv4_count} 个")
+
+    if not data_times:
+        raise Exception("无法解析数据更新时间，拒绝更新 DNS")
+
+    latest_time = max(data_times)
+    now = datetime.now(CHINA_TZ)
+    oldest_allowed = now - timedelta(hours=max_data_age_hours)
+    newest_allowed = now + timedelta(hours=1)
+
+    if latest_time < oldest_allowed:
+        raise Exception(
+            f"数据已过期，最新数据时间 {latest_time.strftime('%Y/%m/%d %H:%M:%S')}，"
+            f"允许最大延迟 {max_data_age_hours} 小时"
+        )
+
+    if latest_time > newest_allowed:
+        raise Exception(f"数据时间异常，最新数据时间 {latest_time.strftime('%Y/%m/%d %H:%M:%S')}")
+
+
+def fetch_rendered_html(url):
+    """
+    使用 Playwright 渲染页面并返回最终 HTML。
+    """
+    timeout_ms = get_int_env("PLAYWRIGHT_TIMEOUT_MS", 60000)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_selector("table.table-striped", state="visible", timeout=timeout_ms)
+            page.wait_for_function(
+                """
+                () => {
+                    const rows = Array.from(document.querySelectorAll('table.table-striped tr'));
+                    return rows.some(row => {
+                        const cells = Array.from(row.querySelectorAll('td, th')).map(cell => cell.innerText.trim());
+                        const ip = cells[2] || '';
+                        return /^(\\d{1,3}\\.){3}\\d{1,3}$/.test(ip) || (ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip));
+                    });
+                }
+                """,
+                timeout=timeout_ms,
+            )
+            return page.content()
+        except PlaywrightTimeoutError as e:
+            raise Exception(f"Playwright 页面渲染超时: {e}") from e
+        finally:
+            browser.close()
 
 
 def fetch_cloudflare_ips():
-    """安全无泄漏的动态抓取，加入强制进程释放"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
-    }
-    
-    print("🚀 强制使用无头浏览器 (requests-html) 动态渲染抓取...")
-    from requests_html import HTMLSession
-    session = HTMLSession()
-    nocache_url = f"{SOURCE_URL}?t={int(time.time())}"
-    
-    try:
-        r = session.get(nocache_url, headers=headers, timeout=20)
-        r.html.render(sleep=6, timeout=20)
-        return parse_cloudflare_html(r.html.html)
-    except Exception as e:
-        raise Exception(f"动态浏览器渲染抓取彻底失败: {e}")
-    finally:
-        # 【深度修复 2】无论成功失败，强制关闭 Chromium 进程，防止僵尸进程 OOM
-        try:
-            session.close()
-        except:
-            pass
-
-
-def fetch_cloudflare_ips_with_retry(max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            return fetch_cloudflare_ips()
-        except Exception as e:
-            print(f"⚠️ 抓取出错 (第 {attempt + 1}/{max_retries} 次): {e}")
-            if attempt < max_retries - 1:
-                print("等待 5 秒后自动重试...")
-                time.sleep(5)
-            else:
-                raise Exception(f"连续 {max_retries} 次抓取失败，放弃执行。")
-
-
-def protect_best_ips(best_ips):
-    protected = {"默认": [], "电信": [], "联通": [], "移动": []}
-
-    for line in ["默认", "电信", "联通", "移动"]:
-        ips = filter_valid_ips(best_ips.get(line, []), 4)
-        if len(ips) < MIN_IPV4_COUNT:
-            continue
-        protected[line] = ips
-
-    if not any(protected.values()):
-        raise Exception("所有线路有效 IP 数量均不足，取消 DNS 更新")
-
-    return protected
+    """
+    使用 Playwright 渲染页面获取最新 Cloudflare IP。
+    """
+    html = fetch_rendered_html(CLOUDFLARE_URL)
+    full, best, data_times = parse_cloudflare_table(html)
+    validate_cloudflare_data(best, data_times)
+    return full, best
 
 
 if __name__ == "__main__":
@@ -268,60 +392,94 @@ if __name__ == "__main__":
     ak = os.environ.get("HUAWEI_ACCESS_KEY")
     sk = os.environ.get("HUAWEI_SECRET_KEY")
     region = os.environ.get("HUAWEI_REGION", "ap-southeast-1")
+    enable_ipv6_dns_sync = get_bool_env("ENABLE_IPV6_DNS_SYNC", False)
 
     if not all([full_domain, ak, sk]):
-        print("环境变量缺失")
+        error_msg = "环境变量 FULL_DOMAIN / HUAWEI_ACCESS_KEY / HUAWEI_SECRET_KEY 必须设置"
+        print(error_msg)
+        send_telegram(f"🚨 <b>DNS 更新失败</b>\n\n❌ {error_msg}")
         sys.exit(1)
 
     try:
         print(f"开始更新 DNS: {full_domain}")
-        hw = HuaWeiApi(ak, sk, region)
-        full_data, best_ips = fetch_cloudflare_ips_with_retry()
-        best_ips = protect_best_ips(best_ips)
-        
-        update_summary = []
-        has_real_update = False
+        print(f"IPv6 DNS 同步: {'启用' if enable_ipv6_dns_sync else '关闭'}")
 
+        # 初始化华为云 API
+        hw = HuaWeiApi(ak, sk, region)
+        
+        # 获取 Cloudflare IP
+        full_data, best_ips = fetch_cloudflare_ips()
+        
+        # 统计更新信息
+        update_summary = []
+
+        # 更新 IPv4
         for line in ["默认", "电信", "联通", "移动"]:
             ip_list = best_ips.get(line, [])
             if ip_list:
-                updated = hw.set_records(full_domain, ip_list, record_type="A", line=line)
-                if updated:
-                    update_summary.append(f"✅ {line} A记录: {len(ip_list)} 个IP")
-                    has_real_update = True
+                hw.set_records(full_domain, ip_list, record_type="A", line=line)
+                update_summary.append(f"✅ {line} A记录: {len(ip_list)} 个IP")
 
-        # 【深度修复 1】解决 Git 脏提交漏洞
-        # 仅在实际发生更新，或本地文件不存在（首次运行）时，才写入数据文件
-        if has_real_update or not os.path.exists("cloudflare_bestip.json"):
-            with open("cloudflare_bestip.json", "w", encoding="utf-8") as f:
-                json.dump({"最优IP": best_ips, "完整数据": full_data}, f, ensure_ascii=False, indent=4)
-            print("JSON 文件已更新")
+        # 更新 IPv6：默认关闭，仅控制 DNS 同步，不影响数据抓取和输出文件
+        ip_list_v6 = best_ips.get("IPv6", [])
+        if enable_ipv6_dns_sync and ip_list_v6:
+            hw.set_records(full_domain, ip_list_v6, record_type="AAAA", line="默认")
+            update_summary.append(f"✅ IPv6 AAAA记录: {len(ip_list_v6)} 个IP")
+        elif ip_list_v6:
+            print("IPv6 DNS 同步已关闭，跳过 AAAA 记录更新")
+            update_summary.append(f"⏭️ IPv6 AAAA记录: 已关闭同步，抓取到 {len(ip_list_v6)} 个IP")
 
-            txt_lines = []
-            for line in ["默认", "电信", "联通", "移动"]:
-                ip_list = best_ips.get(line, [])
-                if not ip_list:
-                    continue
-                for ip in ip_list:
+        # 保存 JSON
+        with open("cloudflare_bestip.json", "w", encoding="utf-8") as f:
+            json.dump({"最优IP": best_ips, "完整数据": full_data}, f, ensure_ascii=False, indent=4)
+        print("JSON 文件保存到 cloudflare_bestip.json")
+
+        # 保存 TXT 文件（使用北京时间）
+        now = datetime.now(CHINA_TZ).strftime("%Y/%m/%d %H:%M:%S")
+        txt_lines = []
+
+        for line in ["默认", "电信", "联通", "移动", "IPv6"]:
+            ip_list = best_ips.get(line, [])
+            if not ip_list:
+                continue
+            txt_lines.append(now)
+            for ip in ip_list:
+                if ":" in ip:  # IPv6
+                    txt_lines.append(f"[{ip}]#{line}")
+                else:
                     txt_lines.append(f"{ip}#{line}")
-                txt_lines.append("")
+            txt_lines.append("")  # 每组之间空行
 
-            with open("cloudflare_bestip.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(txt_lines))
-            print("TXT 文件已更新")
-        else:
-            print("🛑 优选 IP 无实质变化，忽略本地文件覆盖以保持 Git 整洁。")
+        with open("cloudflare_bestip.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(txt_lines))
 
-        china_tz = timezone(timedelta(hours=8))
-        now = datetime.now(china_tz).strftime("%Y/%m/%d %H:%M:%S")
+        print("TXT 文件保存到 cloudflare_bestip.txt")
+        
+        # 发送成功通知（可选）
+        success_msg = f"""✅ <b>DNS 更新成功</b>
 
-        if has_real_update:
-            success_msg = f"✅ <b>DNS 记录已自动变更</b>\n\n📋 域名: <code>{full_domain}</code>\n🕐 时间: {now}\n\n{chr(10).join(update_summary)}"
-            send_telegram(success_msg)
-            print("✅ DNS 变更完成，已推送 TG 通知")
-        else:
-            print("💤 优选 IP 无变动，流程结束。")
+📋 域名: <code>{full_domain}</code>
+🕐 时间: {now}
+
+{chr(10).join(update_summary)}
+"""
+        send_telegram(success_msg)
+        print("✅ DNS 更新完成")
 
     except Exception as e:
-        print(f"❌ 错误: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ 错误: {error_msg}")
+        
+        # 发送失败通知
+        now = datetime.now(CHINA_TZ).strftime("%Y/%m/%d %H:%M:%S")
+        
+        fail_msg = f"""🚨 <b>DNS 更新失败</b>
+
+📋 域名: <code>{full_domain}</code>
+🕐 时间: {now}
+❌ 错误: <code>{error_msg}</code>
+
+请检查日志并手动处理！
+"""
+        send_telegram(fail_msg)
         sys.exit(1)
